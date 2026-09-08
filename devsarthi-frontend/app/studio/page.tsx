@@ -1,13 +1,12 @@
 'use client';
 
-import React, { useState, Suspense } from 'react';
+import React, { useState, useEffect, useRef, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import StudioHeader from '../components/studio/StudioHeader';
 import SourcesPanel from '../components/studio/SourcesPanel';
 import LearningWorkspace, { WorkspaceMode } from '../components/studio/LearningWorkspace';
 import TutorPanel from '../components/studio/TutorPanel';
 import NotesDrawer from '../components/studio/NotesDrawer';
-import { Edit3, Dumbbell, Settings } from 'lucide-react';
 
 type Message = {
   id: string;
@@ -38,40 +37,127 @@ function StudioContent() {
 
   const subject = searchParams?.get('subject') || '';
   const topic = searchParams?.get('topic') || '';
-
   const hasSession = Boolean(subject && topic);
 
-  // Existing state logic
-  const [code, setCode] = useState<string>('// Welcome to DevSarthi Studio\n// Write your code here...\n\ndef bubble_sort(arr):\n    n = len(arr)\n    for i in range(n):\n        for j in range(0, n-i-1):\n            if arr[j] > arr[j+1]:\n                arr[j], arr[j+1] = arr[j+1], arr[j]\n    return arr');
-  const [language, setLanguage] = useState<string>('python');
+  // Default initial states
+  const defaultFiles: FileItem[] = hasSession ? [
+    { name: 'main.py', type: 'code', language: 'python', content: 'def main():\n    print("Hello DevSarthi")\n\nmain()' },
+    { name: 'utils.js', type: 'code', language: 'javascript', content: 'export const add = (a, b) => a + b;' }
+  ] : [];
 
-  const initialMessages: Message[] = hasSession ? [
+  const defaultMessages: Message[] = hasSession ? [
     { id: '1', role: 'assistant', content: 'Hello! I am DevSarthi. How can I help you with your coding today?' }
   ] : [
     { id: '1', role: 'assistant', content: 'Your Socratic learning guide.\n\nAdd a source or start a learning activity, and I\'ll help you understand it step by step.' }
   ];
 
-  const [messages, setMessages] = useState<Message[]>(initialMessages);
+  const [code, setCode] = useState<string>(defaultFiles[0]?.content || '');
+  const [language, setLanguage] = useState<string>('python');
+  const [messages, setMessages] = useState<Message[]>(defaultMessages);
+  const [files, setFiles] = useState<FileItem[]>(defaultFiles);
+  const [activeFile, setActiveFile] = useState<string>(hasSession ? 'main.py' : '');
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(hasSession ? 'entry' : 'welcome');
+
+  // Guard to prevent empty initial state from overwriting DB on first load
+  const [isLoadedFromDB, setIsLoadedFromDB] = useState(false);
+
   const [chatInput, setChatInput] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-
-  const initialFiles: FileItem[] = hasSession ? [
-    { name: 'main.py', type: 'code', language: 'python', content: 'def main():\n    print("Hello DevSarthi")' },
-    { name: 'utils.js', type: 'code', language: 'javascript', content: 'export const add = (a, b) => a + b;' }
-  ] : [];
-
-  const [files, setFiles] = useState<FileItem[]>(initialFiles);
-  const [activeFile, setActiveFile] = useState<string>(hasSession ? 'main.py' : '');
-
   const [sourcesOpen, setSourcesOpen] = useState(true);
   const [tutorOpen, setTutorOpen] = useState(true);
-  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(hasSession ? 'entry' : 'welcome');
   const [notesOpen, setNotesOpen] = useState(false);
 
   type Activity = 'read' | 'practice' | 'code' | null;
   const [sessionActivity, setSessionActivity] = useState<Activity>(null);
 
-  React.useEffect(() => {
+  // Synchronize code edits into active file object
+  const handleCodeChange = (newCode: string) => {
+    setCode(newCode);
+    setFiles(prev =>
+      prev.map(f => (f.name === activeFile ? { ...f, content: newCode } : f))
+    );
+  };
+
+  // -------------------------------------------------------------
+  // 1. Fetch Session from Supabase on mount / topic change
+  // -------------------------------------------------------------
+  useEffect(() => {
+    if (!subject || !topic) {
+      setIsLoadedFromDB(true);
+      return;
+    }
+
+    let isMounted = true;
+
+    async function loadSession() {
+      try {
+        const res = await fetch(
+          `http://localhost:8000/api/studio/session?subject=${encodeURIComponent(subject)}&topic=${encodeURIComponent(topic)}`
+        );
+        if (res.ok) {
+          const result = await res.json();
+          if (isMounted && result.exists && result.data) {
+            const data = result.data;
+            if (data.files && data.files.length > 0) {
+              setFiles(data.files);
+              const target = data.files.find((f: FileItem) => f.name === data.active_file) || data.files[0];
+              setActiveFile(target.name);
+              setCode(target.content);
+              setLanguage(target.language || 'python');
+            }
+            if (data.messages && data.messages.length > 0) {
+              setMessages(data.messages);
+            }
+            if (data.workspace_mode) {
+              setWorkspaceMode(data.workspace_mode);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Backend unavailable, using default session state:', err);
+      } finally {
+        if (isMounted) setIsLoadedFromDB(true);
+      }
+    }
+
+    loadSession();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [subject, topic]);
+
+  // -------------------------------------------------------------
+  // 2. Debounced Auto-Save to Supabase
+  // -------------------------------------------------------------
+  useEffect(() => {
+    if (!isLoadedFromDB || !subject || !topic) return;
+
+    const timer = setTimeout(async () => {
+      try {
+        await fetch('http://localhost:8000/api/studio/session', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            subject,
+            topic,
+            files,
+            active_file: activeFile,
+            code,
+            messages,
+            workspace_mode: workspaceMode,
+          }),
+        });
+      } catch (err) {
+        console.error('Auto-save to Supabase failed:', err);
+      }
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [files, activeFile, code, messages, workspaceMode, subject, topic, isLoadedFromDB]);
+
+  // Activity Switcher
+  useEffect(() => {
     setSessionActivity(null);
   }, [subject, topic]);
 
@@ -82,7 +168,7 @@ function StudioContent() {
     else if (activity === 'code') setWorkspaceMode('editor');
   };
 
-  // Existing Handlers
+  // Tutor Analysis
   const handleAnalyze = async (context?: { snippet?: string; fileName?: string }) => {
     const fileName = context?.fileName || activeFile || 'your code';
     const snippet = context?.snippet;
@@ -117,7 +203,6 @@ function StudioContent() {
         content: data.response || data.message || 'Analysis complete. Do you have any specific doubts?'
       }]);
     } catch {
-      // Graceful local Socratic fallback when FastAPI server is offline
       setTimeout(() => {
         const fallbackHint = snippet
           ? `Looking closely at your selected snippet in **${fileName}**:\n\`\`\`${language}\n${snippet}\n\`\`\`\nWhat output do you expect when this condition evaluates? Does the syntax match Python's indentation rules?`
@@ -149,9 +234,7 @@ function StudioContent() {
     try {
       const response = await fetch('http://localhost:8000/analyze', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code, prompt: userPrompt, language }),
       });
 
@@ -162,11 +245,11 @@ function StudioContent() {
         role: 'assistant',
         content: data.response || data.message || 'Analysis complete. Do you have any specific doubts?'
       }]);
-    } catch (error) {
+    } catch {
       setMessages(prev => [...prev, {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: 'Backend se connect karne mein issue aaya. Make sure FastAPI server (port 8000) and Ollama are running.'
+        content: 'Backend connection issue. Make sure FastAPI server (port 8000) is running.'
       }]);
     } finally {
       setIsAnalyzing(false);
@@ -201,7 +284,6 @@ function StudioContent() {
       sourceType = 'code';
     }
 
-    // For media:
     if (['image', 'pdf', 'video'].includes(sourceType)) {
       const objectUrl = URL.createObjectURL(file);
       const newFile: FileItem = {
@@ -218,7 +300,6 @@ function StudioContent() {
       return;
     }
 
-    // For plain text / code files, read the actual text content
     const reader = new FileReader();
     reader.onload = (event) => {
       const content = event.target?.result as string;
@@ -258,14 +339,6 @@ function StudioContent() {
       setWorkspaceMode('viewer');
       setSessionActivity('read');
 
-      if (sessionActivity) {
-        if (sessionActivity === 'read') setWorkspaceMode('viewer');
-        else if (sessionActivity === 'practice') setWorkspaceMode('practice');
-        else if (sessionActivity === 'code') setWorkspaceMode('editor');
-      } else {
-        setWorkspaceMode('entry');
-      }
-
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
         role: 'user',
@@ -298,7 +371,6 @@ function StudioContent() {
           : selected.language || 'text';
     setLanguage(lang);
 
-    // Keep sessionActivity AND workspaceMode in sync:
     if (selected.type === 'code') {
       if (sessionActivity === 'read') {
         setWorkspaceMode('viewer');
@@ -309,7 +381,6 @@ function StudioContent() {
         setSessionActivity('code');
       }
     } else {
-      // Media, PDFs, YouTube, and Docs switch to Read (viewer)
       setWorkspaceMode('viewer');
       setSessionActivity('read');
     }
@@ -319,7 +390,6 @@ function StudioContent() {
     const updatedFiles = files.filter(f => f.name !== fileName);
     setFiles(updatedFiles);
 
-    // If deleting the active file, switch to the first available source or clear
     if (activeFile === fileName) {
       if (updatedFiles.length > 0) {
         handleFileSelect(updatedFiles[0].name);
@@ -343,17 +413,14 @@ function StudioContent() {
         onActivityChange={handleActivitySelect}
       />
 
-      {/* Main Content Area (3-Panel Architecture) */}
       <main
         className="mt-16 flex-1 grid h-[calc(100vh-4rem)] p-4 gap-4 overflow-hidden relative"
         style={{
           gridTemplateColumns: `${sourcesOpen ? '280px' : '48px'} minmax(400px, 1fr) ${tutorOpen ? '340px' : '0px'}`
         }}
       >
-        {/* Subtle Background Pattern */}
         <div className="absolute inset-0 pointer-events-none opacity-5" style={{ backgroundImage: 'radial-gradient(#013626 1px, transparent 1px)', backgroundSize: '24px 24px' }}></div>
 
-        {/* Left Panel: Sources */}
         <SourcesPanel
           subject={subject}
           topic={topic}
@@ -367,13 +434,12 @@ function StudioContent() {
           onDeleteSource={handleDeleteSource}
         />
 
-        {/* Center Panel: Adaptive Workspace */}
         <LearningWorkspace
           key={activeFile || 'workspace'}
           mode={workspaceMode}
           setMode={setWorkspaceMode}
           code={code}
-          setCode={setCode}
+          setCode={handleCodeChange}
           language={language}
           activeFile={activeFile}
           activeFileType={activeFileType}
@@ -386,7 +452,6 @@ function StudioContent() {
           onActivitySelect={handleActivitySelect}
         />
 
-        {/* Right Panel: DevSarthi Tutor */}
         <TutorPanel
           subject={subject}
           topic={topic}
@@ -399,8 +464,6 @@ function StudioContent() {
           onQuickPrompt={(prompt) => {
             setChatInput(prompt);
             setTimeout(() => {
-              const syntheticEvent = { preventDefault: () => { } } as React.FormEvent;
-              // Pass the prompt directly to avoid state race conditions
               setChatInput('');
               const userMsg: Message = { id: Date.now().toString(), role: 'user', content: prompt };
               setMessages(prev => [...prev, userMsg]);
@@ -429,9 +492,6 @@ function StudioContent() {
             }, 50);
           }}
         />
-
-
-
       </main>
     </div>
   );
