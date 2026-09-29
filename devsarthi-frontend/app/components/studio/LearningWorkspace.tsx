@@ -47,6 +47,8 @@ type LearningWorkspaceProps = {
   onFileUpload?: (e: React.ChangeEvent<HTMLInputElement>) => void;
   onStartSession?: (subject: string, topic: string) => void;
   onActivitySelect?: (activity: 'read' | 'practice' | 'code') => void;
+  isSplitView?: boolean;
+  onToggleSplitView?: () => void;
 };
 
 export default function LearningWorkspace({
@@ -63,13 +65,17 @@ export default function LearningWorkspace({
   topic,
   onFileUpload,
   onStartSession,
-  onActivitySelect
+  onActivitySelect,
+  isSplitView,
+  onToggleSplitView
 }: LearningWorkspaceProps) {
   const { isPyodideReady, isRunning: isPyRunning, runPython } = usePyodide();
 
   const [showSetup, setShowSetup] = useState(false);
   const [tempSubject, setTempSubject] = useState(subject || 'Data Structures');
   const [tempTopic, setTempTopic] = useState(topic || 'Recursion');
+  const [inlineMenuPos, setInlineMenuPos] = useState<{ top: number, left: number } | null>(null);
+  const [selectedSnippet, setSelectedSnippet] = useState('');
 
   const editorRef = React.useRef<any>(null);
 
@@ -136,13 +142,13 @@ export default function LearningWorkspace({
       id: 1,
       scope: 'file',
       type: 'predict',
-      title: 'Code Tracing & Output',
-      prompt: `Trace the evaluation flow in ${activeFile || 'your script'}. What exact output prints if marks = 68?`,
-      codeSnippet: `if marks > 70:\n    print("first class")\nelif marks > 65:\n    print("second class")\nelif marks > 55:\n    print("third class")\nelse:\n    print("fail")`,
-      expectedKeywords: ['second class'],
-      hint1: 'Does Python check > 70 first or > 65?',
-      hint2: '68 > 65 is True, so it executes and halts the chain.',
-      solutionExplanation: '68 fails the first test (>70) but satisfies the elif (>65), printing "second class".'
+      title: `Analysis: ${activeFile || 'Current File'}`,
+      prompt: `Based on the active file (${activeFile || 'your script'}) loaded in your workspace, review the snippet below. What is the primary output or behavior?`,
+      codeSnippet: code ? (code.length > 300 ? code.substring(0, 300) + '\n# [Truncated...]' : code) : `if marks > 70:\n    print("first class")\n...`,
+      expectedKeywords: ['second class', 'error', 'true', 'false', '1', '0', 'none', 'null'],
+      hint1: 'Examine the variables and control flow in the provided workspace snippet.',
+      hint2: 'Step through the first few lines to see what evaluates to True.',
+      solutionExplanation: 'In a dynamic workspace, the exact output depends on the source code provided.'
     },
     {
       id: 2,
@@ -779,17 +785,29 @@ export default function LearningWorkspace({
               {language || activeFileType}
             </span>
           </div>
-          {activeFileType === 'code' && (
-            <button
-              onClick={() => {
-                setMode('editor');
-                if (onActivitySelect) onActivitySelect('code');
-              }}
-              className="text-xs bg-[#013626] text-white px-3 py-1 rounded-md hover:bg-[#001f14] flex items-center gap-1.5 transition-colors shadow-sm"
-            >
-              Open in Editor <ExternalLink className="w-3.5 h-3.5" />
-            </button>
-          )}
+          <div className="flex items-center gap-2">
+            {onToggleSplitView && (
+              <button
+                onClick={onToggleSplitView}
+                className={`text-xs px-3 py-1 rounded-md transition-colors shadow-sm flex items-center gap-1.5 ${isSplitView ? 'bg-[#013626] text-white hover:bg-[#001f14]' : 'bg-white border border-[#c0c9c2] text-[#013626] hover:bg-[#f7f3e9]'}`}
+                title="Toggle Split View"
+              >
+                <TerminalIcon className="w-3.5 h-3.5" />
+                {isSplitView ? 'Close Split' : 'Split View'}
+              </button>
+            )}
+            {activeFileType === 'code' && (
+              <button
+                onClick={() => {
+                  setMode('editor');
+                  if (onActivitySelect) onActivitySelect('code');
+                }}
+                className="text-xs bg-[#013626] text-white px-3 py-1 rounded-md hover:bg-[#001f14] flex items-center gap-1.5 transition-colors shadow-sm"
+              >
+                Open in Editor <ExternalLink className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
         </div>
         <div className="flex-1 w-full bg-white rounded-lg border border-[#c0c9c2] shadow-sm p-5 overflow-y-auto font-mono text-xs md:text-sm text-[#1c1c16] whitespace-pre-wrap leading-relaxed">
           {code || '// No content available in this file'}
@@ -1116,6 +1134,16 @@ export default function LearningWorkspace({
           </span>
         </div>
         <div className="flex items-center gap-2">
+          {onToggleSplitView && (
+            <button
+              onClick={onToggleSplitView}
+              className={`px-3 py-1 rounded text-xs transition-colors flex items-center gap-1.5 shadow-sm ${isSplitView ? 'bg-[#013626] text-white hover:bg-[#001f14]' : 'border border-[#333] text-gray-200 hover:bg-[#2a2a2a]'}`}
+              title="Toggle Split View"
+            >
+              <TerminalIcon className="w-3.5 h-3.5" />
+              {isSplitView ? 'Close Split' : 'Split View'}
+            </button>
+          )}
           <button
             onClick={handleRunCode}
             disabled={isRunning}
@@ -1147,6 +1175,26 @@ export default function LearningWorkspace({
           onChange={(value) => setCode(value || '')}
           onMount={(editor) => {
             editorRef.current = editor;
+            editor.onDidChangeCursorSelection((e: any) => {
+              const selection = editor.getSelection();
+              if (selection && !selection.isEmpty()) {
+                const model = editor.getModel();
+                if (!model) return;
+                const selectedText = model.getValueInRange(selection);
+                
+                // Show floating menu only if enough text is selected
+                if (selectedText.length > 2) {
+                  const position = editor.getScrolledVisiblePosition(selection.getEndPosition());
+                  if (position) {
+                    setInlineMenuPos({ top: position.top + 30, left: position.left });
+                    setSelectedSnippet(selectedText);
+                    return;
+                  }
+                }
+              }
+              setInlineMenuPos(null);
+              setSelectedSnippet('');
+            });
           }}
           options={{
             minimap: { enabled: false },
@@ -1160,6 +1208,42 @@ export default function LearningWorkspace({
             formatOnPaste: true,
           }}
         />
+
+        {inlineMenuPos && selectedSnippet && (
+          <div 
+            className="absolute z-30 flex items-center gap-1 bg-[#1e1e1e] border border-[#333] shadow-2xl rounded-lg p-1.5 pointer-events-auto"
+            style={{ top: inlineMenuPos.top, left: inlineMenuPos.left }}
+          >
+            <button 
+              onClick={() => {
+                onAnalyze({ snippet: selectedSnippet, fileName: activeFile });
+                setInlineMenuPos(null);
+              }}
+              className="px-2 py-1 flex items-center gap-1.5 text-xs font-semibold bg-[#2a2a2a] hover:bg-[#3a3a3a] text-[#a0d1ba] rounded transition-colors"
+            >
+              <Sparkles className="w-3.5 h-3.5" /> Explain
+            </button>
+            <div className="w-[1px] h-4 bg-[#333] mx-1"></div>
+            <button 
+              onClick={() => {
+                onAnalyze({ snippet: selectedSnippet + "\n\nCan you help me fix or debug this?", fileName: activeFile });
+                setInlineMenuPos(null);
+              }}
+              className="px-2 py-1 flex items-center gap-1.5 text-xs text-gray-300 hover:text-white hover:bg-[#2a2a2a] rounded transition-colors"
+            >
+              <Terminal className="w-3.5 h-3.5" /> Debug
+            </button>
+            <button 
+              onClick={() => {
+                onAnalyze({ snippet: selectedSnippet + "\n\nHow can I optimize this code?", fileName: activeFile });
+                setInlineMenuPos(null);
+              }}
+              className="px-2 py-1 flex items-center gap-1.5 text-xs text-gray-300 hover:text-white hover:bg-[#2a2a2a] rounded transition-colors"
+            >
+              <Lightbulb className="w-3.5 h-3.5" /> Optimize
+            </button>
+          </div>
+        )}
 
         {code.includes('factorial') && (
           <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-[#1a1a1a] border border-[#333] rounded-full px-3 py-1.5 flex items-center gap-2 shadow-xl backdrop-blur-md z-20">

@@ -2,11 +2,20 @@
 
 import React, { useState, useEffect, useRef, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
+import Link from 'next/link';
+import { createClient } from '@supabase/supabase-js';
+import {
+  Component, Search, LayoutDashboard, Sparkles, BookOpen, LineChart, Calendar, Target, Timer, Activity, LogOut, CheckCircle
+} from 'lucide-react';
+
+import { supabase } from '../../utils/supabase';
+
 import StudioHeader from '../components/studio/StudioHeader';
 import SourcesPanel from '../components/studio/SourcesPanel';
 import LearningWorkspace, { WorkspaceMode } from '../components/studio/LearningWorkspace';
 import TutorPanel from '../components/studio/TutorPanel';
 import NotesDrawer from '../components/studio/NotesDrawer';
+import CommandPalette from '../components/studio/CommandPalette';
 
 type Message = {
   id: string;
@@ -14,13 +23,16 @@ type Message = {
   content: string;
 };
 
-export type SourceType = "code" | "image" | "pdf" | "document" | "text" | "video" | "youtube" | "unknown";
+export type SourceType = "code" | "image" | "pdf" | "document" | "text" | "video" | "youtube" | "folder" | "unknown";
 
 export type FileItem = {
+  id: string;
   name: string;
   type: SourceType;
   language: string;
   content: string;
+  parent_id?: string | null;
+  updated_at?: string;
 };
 
 export default function StudioPage() {
@@ -35,14 +47,20 @@ function StudioContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
 
-  const subject = searchParams?.get('subject') || '';
-  const topic = searchParams?.get('topic') || '';
-  const hasSession = Boolean(subject && topic);
+  const notebookIdParam = searchParams?.get('notebookId');
+  const subjectParam = searchParams?.get('subject') || '';
+  const topicParam = searchParams?.get('topic') || '';
+
+  const [notebookId, setNotebookId] = useState<string | null>(notebookIdParam || null);
+  const [subject, setSubject] = useState(subjectParam);
+  const [topic, setTopic] = useState(topicParam);
+
+  const hasSession = Boolean(subject && topic) || Boolean(notebookId);
 
   // Default initial states
   const defaultFiles: FileItem[] = hasSession ? [
-    { name: 'main.py', type: 'code', language: 'python', content: 'def main():\n    print("Hello DevSarthi")\n\nmain()' },
-    { name: 'utils.js', type: 'code', language: 'javascript', content: 'export const add = (a, b) => a + b;' }
+    { id: 'default-file-1', name: 'main.py', type: 'code', language: 'python', content: 'def main():\n    print("Hello DevSarthi")\n\nmain()', parent_id: null, updated_at: new Date().toISOString() },
+    { id: 'default-file-2', name: 'utils.js', type: 'code', language: 'javascript', content: 'export const add = (a, b) => a + b;', parent_id: null, updated_at: new Date().toISOString() }
   ] : [];
 
   const defaultMessages: Message[] = hasSession ? [
@@ -57,9 +75,17 @@ function StudioContent() {
   const [files, setFiles] = useState<FileItem[]>(defaultFiles);
   const [activeFile, setActiveFile] = useState<string>(hasSession ? 'main.py' : '');
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(hasSession ? 'entry' : 'welcome');
+  
+  const [profile, setProfile] = useState({ fullName: 'Student', course: 'IT', semester: 'V', initials: 'ST' });
+  const [upcomingEventsList, setUpcomingEventsList] = useState<any[]>([]);
+  const [recentActivities, setRecentActivities] = useState<any[]>([]);
 
   // Guard to prevent empty initial state from overwriting DB on first load
   const [isLoadedFromDB, setIsLoadedFromDB] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isSaveModalOpen, setIsSaveModalOpen] = useState(false);
+  const [saveModalName, setSaveModalName] = useState('');
+  const [saveSuccessMsg, setSaveSuccessMsg] = useState('');
 
   const [chatInput, setChatInput] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -70,6 +96,20 @@ function StudioContent() {
   type Activity = 'read' | 'practice' | 'code' | null;
   const [sessionActivity, setSessionActivity] = useState<Activity>(null);
 
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [isSplitView, setIsSplitView] = useState(false);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setIsCommandPaletteOpen(true);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
   // Synchronize code edits into active file object
   const handleCodeChange = (newCode: string) => {
     setCode(newCode);
@@ -78,83 +118,186 @@ function StudioContent() {
     );
   };
 
-  // -------------------------------------------------------------
-  // 1. Fetch Session from Supabase on mount / topic change
-  // -------------------------------------------------------------
   useEffect(() => {
-    if (!subject || !topic) {
-      setIsLoadedFromDB(true);
-      return;
-    }
+    async function loadData() {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) {
+        router.push('/login');
+        return;
+      }
+      
+      const { data: userData } = await supabase
+        .from('users')
+        .select('full_name, course, semester')
+        .eq('id', user.id)
+        .single();
+        
+      if (userData) {
+        const nameParts = userData.full_name?.trim().split(' ') || [];
+        const initials = nameParts.length >= 2 ? `${nameParts[0][0]}${nameParts[1][0]}`.toUpperCase() : (userData.full_name?.slice(0, 2).toUpperCase() || 'ST');
+        setProfile({ fullName: userData.full_name, course: userData.course || 'IT', semester: userData.semester || 'V', initials });
+      }
 
-    let isMounted = true;
+      const today = new Date().toISOString().split('T')[0];
+      const { data: eventsData } = await supabase
+        .from('events')
+        .select('id, title, event_date, event_type')
+        .eq('user_id', user.id)
+        .gte('event_date', today)
+        .order('event_date', { ascending: true })
+        .limit(3);
+      if (eventsData) setUpcomingEventsList(eventsData);
+      
+      const { data: actData } = await supabase
+        .from('activity_log')
+        .select('id, title, activity_type, created_at')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(3);
+      if (actData) setRecentActivities(actData);
 
-    async function loadSession() {
-      try {
-        const res = await fetch(
-          `http://localhost:8000/api/studio/session?subject=${encodeURIComponent(subject)}&topic=${encodeURIComponent(topic)}`
-        );
-        if (res.ok) {
-          const result = await res.json();
-          if (isMounted && result.exists && result.data) {
-            const data = result.data;
-            if (data.files && data.files.length > 0) {
-              setFiles(data.files);
-              const target = data.files.find((f: FileItem) => f.name === data.active_file) || data.files[0];
+      if (notebookIdParam) {
+        const { data: nbData, error } = await supabase
+          .from('notebooks')
+          .select('*')
+          .eq('id', notebookIdParam)
+          .eq('user_id', user.id)
+          .single();
+          
+        if (error) {
+          console.error("Supabase Error [studio notebookId]:", error.message);
+        }
+
+        if (nbData && !error) {
+          setSubject(nbData.subject);
+          setTopic(nbData.topic || '');
+          if (nbData.content) {
+            const parsed = typeof nbData.content === 'string' ? JSON.parse(nbData.content) : nbData.content;
+            if (parsed.files && parsed.files.length > 0) {
+              setFiles(parsed.files);
+              const target = parsed.files.find((f: FileItem) => f.name === parsed.active_file) || parsed.files[0];
               setActiveFile(target.name);
               setCode(target.content);
               setLanguage(target.language || 'python');
             }
-            if (data.messages && data.messages.length > 0) {
-              setMessages(data.messages);
-            }
-            if (data.workspace_mode) {
-              setWorkspaceMode(data.workspace_mode);
-            }
+            if (parsed.messages && parsed.messages.length > 0) setMessages(parsed.messages);
+            if (parsed.workspace_mode) setWorkspaceMode(parsed.workspace_mode);
           }
         }
-      } catch (err) {
-        console.warn('Backend unavailable, using default session state:', err);
-      } finally {
-        if (isMounted) setIsLoadedFromDB(true);
+      } else if (subjectParam && topicParam) {
+        const { data: nbData, error } = await supabase
+          .from('notebooks')
+          .select('*')
+          .eq('subject', subjectParam)
+          .eq('topic', topicParam)
+          .eq('user_id', user.id)
+          .order('updated_at', { ascending: false })
+          .limit(1)
+          .single();
+          
+        if (error) {
+          console.error("Supabase Error [studio subject/topic]:", error.message);
+        }
+
+        if (nbData) {
+          setNotebookId(nbData.id);
+          if (nbData.content) {
+            const parsed = typeof nbData.content === 'string' ? JSON.parse(nbData.content) : nbData.content;
+            if (parsed.files && parsed.files.length > 0) setFiles(parsed.files);
+            if (parsed.active_file) {
+                const target = parsed.files?.find((f: FileItem) => f.name === parsed.active_file);
+                if (target) {
+                    setActiveFile(target.name);
+                    setCode(target.content);
+                    setLanguage(target.language || 'python');
+                }
+            }
+            if (parsed.messages && parsed.messages.length > 0) setMessages(parsed.messages);
+            if (parsed.workspace_mode) setWorkspaceMode(parsed.workspace_mode);
+          }
+        }
       }
+      setIsLoadedFromDB(true);
     }
+    loadData();
+  }, [notebookIdParam, subjectParam, topicParam, router]);
 
-    loadSession();
+  const handleSave = async (silent = false, customTitle?: string) => {
+    const currentSubject = subject || 'Untitled Session';
+    const finalTitle = customTitle || topic || currentSubject;
+    if (customTitle) setTopic(customTitle);
+    
+    setIsSaving(!silent);
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
+      
+      const payload = {
+        title: finalTitle,
+        subject: currentSubject,
+        topic: finalTitle,
+        coverage: 15,
+        content: JSON.stringify({
+          files,
+          active_file: activeFile,
+          messages,
+          workspace_mode: workspaceMode
+        }),
+        user_id: user.id,
+        updated_at: new Date().toISOString()
+      };
+      
+      let currentNotebookId = notebookId;
 
-    return () => {
-      isMounted = false;
-    };
-  }, [subject, topic]);
-
-  // -------------------------------------------------------------
-  // 2. Debounced Auto-Save to Supabase
-  // -------------------------------------------------------------
-  useEffect(() => {
-    if (!isLoadedFromDB || !subject || !topic) return;
-
-    const timer = setTimeout(async () => {
-      try {
-        await fetch('http://localhost:8000/api/studio/session', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            subject,
-            topic,
-            files,
-            active_file: activeFile,
-            code,
-            messages,
-            workspace_mode: workspaceMode,
-          }),
-        });
-      } catch (err) {
-        console.error('Auto-save to Supabase failed:', err);
+      if (currentNotebookId) {
+        await supabase
+          .from('notebooks')
+          .update(payload)
+          .eq('id', currentNotebookId);
+      } else {
+        const { data, error } = await supabase
+          .from('notebooks')
+          .insert(payload)
+          .select()
+          .single();
+        if (data && !error) {
+          setNotebookId(data.id);
+          currentNotebookId = data.id;
+          const params = new URLSearchParams(searchParams?.toString() || '');
+          params.set('notebookId', data.id);
+          router.replace(`/studio?${params.toString()}`);
+        }
       }
-    }, 1000);
+      
+      
+      if (silent !== true) {
+        await supabase
+          .from('activity_log')
+          .insert({
+            user_id: user.id,
+            title: `Updated notebook: ${payload.title}`,
+            activity_type: 'code',
+            action: 'Saved session in AI Studio'
+          });
+        setSaveSuccessMsg('Notebook successfully saved!');
+        setTimeout(() => setSaveSuccessMsg(''), 3000);
+      }
+        
+    } catch (err) {
+      console.error('Save failed:', err);
+    } finally {
+      setIsSaving(false);
+    }
+  };
 
-    return () => clearTimeout(timer);
-  }, [files, activeFile, code, messages, workspaceMode, subject, topic, isLoadedFromDB]);
+  // Auto-save effect
+  useEffect(() => {
+    if (!isLoadedFromDB) return;
+    const timeoutId = setTimeout(() => {
+      handleSave(true);
+    }, 2000);
+    return () => clearTimeout(timeoutId);
+  }, [files, messages, activeFile, workspaceMode, isLoadedFromDB, subject]);
 
   // Activity Switcher
   useEffect(() => {
@@ -287,10 +430,13 @@ function StudioContent() {
     if (['image', 'pdf', 'video'].includes(sourceType)) {
       const objectUrl = URL.createObjectURL(file);
       const newFile: FileItem = {
+        id: crypto.randomUUID(),
         name: file.name,
         type: sourceType,
         language: ext || 'binary',
-        content: objectUrl
+        content: objectUrl,
+        parent_id: null,
+        updated_at: new Date().toISOString()
       };
 
       setFiles(prev => [...prev, newFile]);
@@ -304,10 +450,13 @@ function StudioContent() {
     reader.onload = (event) => {
       const content = event.target?.result as string;
       const newFile: FileItem = {
+        id: crypto.randomUUID(),
         name: file.name,
         type: sourceType,
         language: ext || 'text',
-        content
+        content,
+        parent_id: null,
+        updated_at: new Date().toISOString()
       };
       setFiles(prev => [...prev, newFile]);
       setActiveFile(file.name);
@@ -315,6 +464,46 @@ function StudioContent() {
       setWorkspaceMode(sourceType === 'code' ? 'editor' : 'viewer');
     };
     reader.readAsText(file);
+  };
+
+  const handleCreateNode = (name: string, type: 'file' | 'folder', parentId: string | null) => {
+    let sourceType: SourceType = 'unknown';
+    let language = 'text';
+
+    if (type === 'folder') {
+      sourceType = 'folder';
+      language = 'folder';
+    } else {
+      const ext = name.split('.').pop()?.toLowerCase() || '';
+      const codeExtensions = ['py', 'js', 'jsx', 'ts', 'tsx', 'html', 'css', 'json', 'java', 'c', 'cpp', 'cs', 'go', 'rs', 'php', 'rb', 'sql', 'sh'];
+      if (codeExtensions.includes(ext)) {
+        sourceType = 'code';
+        language = ext;
+      } else if (['md', 'txt', 'csv'].includes(ext)) {
+        sourceType = 'document';
+        language = ext;
+      } else {
+        sourceType = 'text';
+      }
+    }
+
+    const newFile: FileItem = {
+      id: crypto.randomUUID(),
+      name,
+      type: sourceType,
+      language,
+      content: '',
+      parent_id: parentId,
+      updated_at: new Date().toISOString()
+    };
+
+    setFiles(prev => [...prev, newFile]);
+
+    if (type === 'file') {
+      setActiveFile(newFile.name);
+      setCode('');
+      setWorkspaceMode('editor');
+    }
   };
 
   const handleStartSession = (newSubject: string, newTopic: string) => {
@@ -328,10 +517,13 @@ function StudioContent() {
     const url = prompt("Enter YouTube tutorial link:");
     if (url) {
       const newFile: FileItem = {
+        id: crypto.randomUUID(),
         name: `YouTube Video ${files.length + 1}`,
         type: 'youtube',
         language: 'video',
-        content: url
+        content: url,
+        parent_id: null,
+        updated_at: new Date().toISOString()
       };
       setFiles(prev => [...prev, newFile]);
       setActiveFile(newFile.name);
@@ -405,16 +597,24 @@ function StudioContent() {
   const activeFileType = activeFileObj?.type || 'unknown';
 
   return (
-    <div className="flex flex-col min-h-screen bg-[#FDF9EF] font-body-md text-[#1c1c16] overflow-hidden">
+    <div className="h-screen flex flex-col bg-[#FDF9EF] font-body-md text-[#1c1c16] overflow-hidden">
       <StudioHeader
         subject={subject}
         topic={topic}
         activity={sessionActivity || 'code'}
         onActivityChange={handleActivitySelect}
+        profile={profile}
+        upcomingEventsList={upcomingEventsList}
+        recentActivities={recentActivities}
+        onSave={() => {
+          setSaveModalName(topic || subject || 'Untitled Session');
+          setIsSaveModalOpen(true);
+        }}
+        isSaving={isSaving}
       />
 
       <main
-        className="mt-16 flex-1 grid h-[calc(100vh-4rem)] p-4 gap-4 overflow-hidden relative"
+        className="mt-16 flex-1 grid p-4 gap-4 overflow-hidden relative h-[calc(100vh-4rem)]"
         style={{
           gridTemplateColumns: `${sourcesOpen ? '280px' : '48px'} minmax(400px, 1fr) ${tutorOpen ? '340px' : '0px'}`
         }}
@@ -432,25 +632,75 @@ function StudioContent() {
           onFileUpload={handleFileUpload}
           onYoutubeLink={handleYoutubeLink}
           onDeleteSource={handleDeleteSource}
+          onCreateNode={handleCreateNode}
         />
 
-        <LearningWorkspace
-          key={activeFile || 'workspace'}
-          mode={workspaceMode}
-          setMode={setWorkspaceMode}
-          code={code}
-          setCode={handleCodeChange}
-          language={language}
-          activeFile={activeFile}
-          activeFileType={activeFileType}
-          onAnalyze={handleAnalyze}
-          isAnalyzing={isAnalyzing}
-          subject={subject}
-          topic={topic}
-          onFileUpload={handleFileUpload}
-          onStartSession={handleStartSession}
-          onActivitySelect={handleActivitySelect}
-        />
+        {isSplitView ? (
+          <div className="flex gap-4 min-w-0 h-full w-full">
+            <div className="flex-1 min-w-0">
+              <LearningWorkspace
+                key={activeFile + '-viewer'}
+                mode="viewer"
+                setMode={setWorkspaceMode}
+                code={code}
+                setCode={handleCodeChange}
+                language={language}
+                activeFile={activeFile}
+                activeFileType={activeFileType}
+                onAnalyze={handleAnalyze}
+                isAnalyzing={isAnalyzing}
+                subject={subject}
+                topic={topic}
+                onFileUpload={handleFileUpload}
+                onStartSession={handleStartSession}
+                onActivitySelect={handleActivitySelect}
+                isSplitView={isSplitView}
+                onToggleSplitView={() => setIsSplitView(!isSplitView)}
+              />
+            </div>
+            <div className="flex-1 min-w-0">
+              <LearningWorkspace
+                key="scratchpad"
+                mode="editor"
+                setMode={() => {}}
+                code={`# Scratchpad for ${activeFile}\n\n`}
+                setCode={() => {}}
+                language="python"
+                activeFile="scratchpad.py"
+                activeFileType="code"
+                onAnalyze={handleAnalyze}
+                isAnalyzing={isAnalyzing}
+                subject={subject}
+                topic={topic}
+                onFileUpload={handleFileUpload}
+                onStartSession={handleStartSession}
+                onActivitySelect={handleActivitySelect}
+                isSplitView={isSplitView}
+                onToggleSplitView={() => setIsSplitView(!isSplitView)}
+              />
+            </div>
+          </div>
+        ) : (
+          <LearningWorkspace
+            key={activeFile || 'workspace'}
+            mode={workspaceMode}
+            setMode={setWorkspaceMode}
+            code={code}
+            setCode={handleCodeChange}
+            language={language}
+            activeFile={activeFile}
+            activeFileType={activeFileType}
+            onAnalyze={handleAnalyze}
+            isAnalyzing={isAnalyzing}
+            subject={subject}
+            topic={topic}
+            onFileUpload={handleFileUpload}
+            onStartSession={handleStartSession}
+            onActivitySelect={handleActivitySelect}
+            isSplitView={isSplitView}
+            onToggleSplitView={() => setIsSplitView(!isSplitView)}
+          />
+        )}
 
         <TutorPanel
           subject={subject}
@@ -492,7 +742,82 @@ function StudioContent() {
             }, 50);
           }}
         />
-      </main>
+        <CommandPalette 
+          isOpen={isCommandPaletteOpen}
+          onClose={() => setIsCommandPaletteOpen(false)}
+          onAskDevSarthi={(prompt) => {
+            const userMsg: Message = { id: Date.now().toString(), role: 'user', content: prompt };
+            setMessages(prev => [...prev, userMsg]);
+            setIsAnalyzing(true);
+            if (!tutorOpen) setTutorOpen(true);
+            fetch('http://localhost:8000/analyze', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ code, prompt, language }),
+            })
+            .then(res => res.json())
+            .then(data => {
+              setMessages(prev => [...prev, {
+                id: (Date.now() + 1).toString(),
+                role: 'assistant',
+                content: data.response || data.message || 'Analysis complete.'
+              }]);
+            })
+            .catch(() => {
+              setMessages(prev => [...prev, {
+                id: (Date.now() + 1).toString(),
+                role: 'assistant',
+                content: 'DevSarthi backend is currently offline. Start Ollama / FastAPI on port 8000.'
+              }]);
+            })
+            .finally(() => setIsAnalyzing(false));
+          }}
+          onSwitchMode={(mode) => setWorkspaceMode(mode as WorkspaceMode)}
+        />
+        </main>
+
+        {isSaveModalOpen && (
+          <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+            <div className="bg-white rounded-xl shadow-xl border border-gray-200 p-6 max-w-sm w-full">
+              <h3 className="font-serif text-lg font-bold text-[#013626] mb-4">Save Notebook</h3>
+              <div className="mb-4">
+                <label className="block text-sm font-semibold text-gray-700 mb-1">Notebook Name</label>
+                <input
+                  type="text"
+                  value={saveModalName}
+                  onChange={(e) => setSaveModalName(e.target.value)}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-[#013626]"
+                  placeholder="Enter a name..."
+                />
+              </div>
+              <div className="flex justify-end gap-2">
+                <button
+                  onClick={() => setIsSaveModalOpen(false)}
+                  className="px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    handleSave(false, saveModalName);
+                    setIsSaveModalOpen(false);
+                  }}
+                  disabled={isSaving}
+                  className="px-4 py-2 text-sm font-medium text-white bg-[#013626] hover:bg-[#001f14] rounded-lg transition-colors disabled:opacity-50"
+                >
+                  {isSaving ? 'Saving...' : 'Save'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {saveSuccessMsg && (
+          <div className="fixed bottom-4 right-4 bg-[#013626] text-white px-4 py-3 rounded-lg shadow-lg flex items-center gap-2 z-50">
+            <CheckCircle className="w-5 h-5 text-emerald-400" />
+            <span className="font-medium text-sm">{saveSuccessMsg}</span>
+          </div>
+        )}
     </div>
   );
 }
